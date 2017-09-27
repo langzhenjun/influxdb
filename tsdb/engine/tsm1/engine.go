@@ -242,13 +242,10 @@ func (e *Engine) enableLevelCompactions(wait bool) {
 	quit := make(chan struct{})
 	e.done = quit
 
-	e.wg.Add(4)
+	e.wg.Add(1)
 	e.mu.Unlock()
 
-	go func() { defer e.wg.Done(); e.compactTSMFull(quit) }()
-	go func() { defer e.wg.Done(); e.compactTSMLevel(true, 1, quit) }()
-	go func() { defer e.wg.Done(); e.compactTSMLevel(true, 2, quit) }()
-	go func() { defer e.wg.Done(); e.compactTSMLevel(true, 3, quit) }()
+	go func() { defer e.wg.Done(); e.compact(quit) }()
 }
 
 // disableLevelCompactions will stop level compactions before returning.
@@ -1249,7 +1246,7 @@ func (e *Engine) ShouldCompactCache(lastWriteTime time.Time) bool {
 		time.Since(lastWriteTime) > e.CacheFlushWriteColdDuration
 }
 
-func (e *Engine) compactTSMLevel(fast bool, level int, quit <-chan struct{}) {
+func (e *Engine) compact(quit <-chan struct{}) {
 	t := time.NewTicker(time.Second)
 	defer t.Stop()
 
@@ -1259,35 +1256,159 @@ func (e *Engine) compactTSMLevel(fast bool, level int, quit <-chan struct{}) {
 			return
 
 		case <-t.C:
-			s := e.levelCompactionStrategy(fast, level)
-			if s != nil {
-				s.Apply()
-				// Release the files in the compaction plan
-				e.CompactionPlan.Release(s.compactionGroups)
-			}
 
+			// level 1 and 2 are higher priority and can take all the available capacity
+			// of the hi and lo limiter.
+			level1Groups := e.compactHiPriorityLevel(1)
+			level2Groups := e.compactHiPriorityLevel(2)
+
+			// level 3 and 4 are lower priority and can take upto 20% additional capacity
+			// from the high limiter if the lo limiter if max out and the hi is not fully
+			// utilized
+			level3Groups := e.compactLoPriorityLevel(3)
+			level4Groups := e.compactFull()
+
+			// Release all the plans we didn't start.
+			e.CompactionPlan.Release(level1Groups)
+			e.CompactionPlan.Release(level2Groups)
+			e.CompactionPlan.Release(level3Groups)
+			e.CompactionPlan.Release(level4Groups)
 		}
 	}
 }
 
-func (e *Engine) compactTSMFull(quit <-chan struct{}) {
-	t := time.NewTicker(time.Second)
-	defer t.Stop()
+// compactHiPriorityLevel kicks off compactions using the high priority policy. It returns
+// the plans that were not able to be started.
+func (e *Engine) compactHiPriorityLevel(level int) []CompactionGroup {
+	// Reserve the plans for level 1
+	groups := e.CompactionPlan.PlanLevel(level)
+	for len(groups) > 0 {
 
-	for {
-		select {
-		case <-quit:
-			return
+		// Grab the first group
+		grp := groups[:1]
 
-		case <-t.C:
-			s := e.fullCompactionStrategy()
-			if s != nil {
+		s := e.levelCompactionStrategy(grp, true, level)
+		if s == nil {
+			break
+		}
+
+		// Try hi priority limiter, otherwise steal a little from the low priority if we can.
+		if e.hiPriCompactionLimiter.TryTake() {
+			go func() {
+				defer e.hiPriCompactionLimiter.Release()
 				s.Apply()
 				// Release the files in the compaction plan
 				e.CompactionPlan.Release(s.compactionGroups)
-			}
+			}()
+		} else if e.loPriCompactionLimiter.TryTake() {
+			go func() {
+				defer e.loPriCompactionLimiter.Release()
+				s.Apply()
+				// Release the files in the compaction plan
+				e.CompactionPlan.Release(s.compactionGroups)
+			}()
+		} else {
+			// Can't start any new compactions
+			break
 		}
+		// Slice off the group we just ran, it will be released when the compaction
+		// goroutine exits.
+		groups = groups[1:]
 	}
+
+	// Return the unused plans
+	return groups
+}
+
+// compactLoPriorityLevel kicks off compactions using the lo priority policy. It returns
+// the plans that were not able to be started
+func (e *Engine) compactLoPriorityLevel(level int) []CompactionGroup {
+	groups := e.CompactionPlan.PlanLevel(level)
+	running := int(atomic.LoadInt64(&e.stats.TSMCompactionsActive[level-1]))
+	for len(groups) > 0 {
+		grp := groups[:1]
+
+		s := e.levelCompactionStrategy(grp, false, level)
+		if s == nil {
+			break
+		}
+
+		// We're allowed to steal up to 20% additional of the lower priority from high priority
+		stealable := e.loPriCompactionLimiter.Capacity() / 5
+		if stealable == 0 {
+			stealable = 1
+		}
+
+		// Try the lo priority limiter, otherwise steal a little from the high priority if we can.
+		if e.loPriCompactionLimiter.TryTake() {
+			go func() {
+				defer e.loPriCompactionLimiter.Release()
+				s.Apply()
+				// Release the files in the compaction plan
+				e.CompactionPlan.Release(s.compactionGroups)
+			}()
+		} else if running < e.loPriCompactionLimiter.Capacity()+stealable && e.hiPriCompactionLimiter.TryTake() {
+			go func() {
+				defer e.hiPriCompactionLimiter.Release()
+				s.Apply()
+				// Release the files in the compaction plan
+				e.CompactionPlan.Release(s.compactionGroups)
+			}()
+		} else {
+			break
+		}
+		groups = groups[1:]
+	}
+	return groups
+}
+
+// compactFull kicks off full and optimize compactions using the lo priority policy. It returns
+// the plans that were not able to be started.
+func (e *Engine) compactFull() []CompactionGroup {
+	optimize := false
+	groups := e.CompactionPlan.Plan(e.WAL.LastWriteTime())
+
+	if len(groups) == 0 {
+		optimize = true
+		groups = e.CompactionPlan.PlanOptimize()
+	}
+
+	// We're allowed to steal up to 20% additional of the lower priority from high priority
+	stealable := e.loPriCompactionLimiter.Capacity() / 5
+	if stealable == 0 {
+		stealable = 1
+	}
+
+	running := int(atomic.LoadInt64(&e.stats.TSMFullCompactionsActive) + atomic.LoadInt64(&e.stats.TSMOptimizeCompactionsActive))
+	for len(groups) > 0 {
+		grp := groups[:1]
+
+		s := e.fullCompactionStrategy(grp, optimize)
+		if s == nil {
+			break
+		}
+
+		// Try the lo priority limiter, otherwise steal a little from the high priority if we can.
+		if e.loPriCompactionLimiter.TryTake() {
+			go func() {
+				defer e.loPriCompactionLimiter.Release()
+				s.Apply()
+				// Release the files in the compaction plan
+				e.CompactionPlan.Release(s.compactionGroups)
+			}()
+		} else if running < e.loPriCompactionLimiter.Capacity()+stealable && e.hiPriCompactionLimiter.TryTake() {
+			go func() {
+				defer e.hiPriCompactionLimiter.Release()
+				s.Apply()
+				// Release the files in the compaction plan
+				e.CompactionPlan.Release(s.compactionGroups)
+			}()
+		} else {
+			break
+		}
+		groups = groups[1:]
+	}
+	return groups
 }
 
 // onFileStoreReplace is callback handler invoked when the FileStore
@@ -1386,32 +1507,9 @@ func (s *compactionStrategy) Apply() {
 
 // compactGroup executes the compaction strategy against a single CompactionGroup.
 func (s *compactionStrategy) compactGroup(groupNum int) {
-	// Level 1 and 2 are high priority and have a larger slice of the pool.  If all
-	// the high priority capacity is used up, they can steal from the low priority
-	// pool as well if there is capacity.  Otherwise, it wait on the high priority
-	// limiter until an running compaction completes.  Level 3 and 4 are low priority
-	// as they are generally larger compactions and more expensive to run.  They can
-	// steal a little from the high priority limiter if there is no high priority work.
-	switch s.level {
-	case 1, 2:
-		if s.hiPriLimiter.TryTake() {
-			defer s.hiPriLimiter.Release()
-		} else if s.loPriLimiter.TryTake() {
-			defer s.loPriLimiter.Release()
-		} else {
-			s.hiPriLimiter.Take()
-			defer s.hiPriLimiter.Release()
-		}
-	default:
-		if s.loPriLimiter.TryTake() {
-			defer s.loPriLimiter.Release()
-		} else if s.hiPriLimiter.Idle() && s.hiPriLimiter.TryTake() {
-			defer s.hiPriLimiter.Release()
-		} else {
-			s.loPriLimiter.Take()
-			defer s.loPriLimiter.Release()
-		}
-	}
+	// Keep track of running compactions.
+	atomic.AddInt64(s.activeStat, 1)
+	defer atomic.AddInt64(s.activeStat, -1)
 
 	group := s.compactionGroups[groupNum]
 	start := time.Now()
@@ -1420,17 +1518,16 @@ func (s *compactionStrategy) compactGroup(groupNum int) {
 		s.logger.Info(fmt.Sprintf("compacting %s group (%d) %s (#%d)", s.description, groupNum, f, i))
 	}
 
-	files, err := func() ([]string, error) {
-		// Count the compaction as active only while the compaction is actually running.
-		atomic.AddInt64(s.activeStat, 1)
-		defer atomic.AddInt64(s.activeStat, -1)
+	var (
+		err   error
+		files []string
+	)
 
-		if s.fast {
-			return s.compactor.CompactFast(group)
-		} else {
-			return s.compactor.CompactFull(group)
-		}
-	}()
+	if s.fast {
+		files, err = s.compactor.CompactFast(group)
+	} else {
+		files, err = s.compactor.CompactFull(group)
+	}
 
 	if err != nil {
 		_, inProgress := err.(errCompactionInProgress)
@@ -1465,9 +1562,7 @@ func (s *compactionStrategy) compactGroup(groupNum int) {
 
 // levelCompactionStrategy returns a compactionStrategy for the given level.
 // It returns nil if there are no TSM files to compact.
-func (e *Engine) levelCompactionStrategy(fast bool, level int) *compactionStrategy {
-	compactionGroups := e.CompactionPlan.PlanLevel(level)
-
+func (e *Engine) levelCompactionStrategy(compactionGroups []CompactionGroup, fast bool, level int) *compactionStrategy {
 	if len(compactionGroups) == 0 {
 		return nil
 	}
@@ -1493,15 +1588,7 @@ func (e *Engine) levelCompactionStrategy(fast bool, level int) *compactionStrate
 
 // fullCompactionStrategy returns a compactionStrategy for higher level generations of TSM files.
 // It returns nil if there are no TSM files to compact.
-func (e *Engine) fullCompactionStrategy() *compactionStrategy {
-	optimize := false
-	compactionGroups := e.CompactionPlan.Plan(e.WAL.LastWriteTime())
-
-	if len(compactionGroups) == 0 {
-		optimize = true
-		compactionGroups = e.CompactionPlan.PlanOptimize()
-	}
-
+func (e *Engine) fullCompactionStrategy(compactionGroups []CompactionGroup, optimize bool) *compactionStrategy {
 	if len(compactionGroups) == 0 {
 		return nil
 	}
