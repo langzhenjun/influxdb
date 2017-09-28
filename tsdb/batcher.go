@@ -60,9 +60,22 @@ func (b *PointBatcher) Start() {
 	var timerCh <-chan time.Time
 
 	emit := func() {
+		// Nothing batched?
+		if batch == nil {
+			return
+		}
 		b.out <- batch
 		atomic.AddUint64(&b.stats.BatchTotal, 1)
 		batch = nil
+
+		// No timer?
+		if timer == nil {
+			return
+		}
+		timer.Stop()
+		timer = nil
+		timerCh = nil
+
 	}
 
 	b.wg = &sync.WaitGroup{}
@@ -75,7 +88,6 @@ func (b *PointBatcher) Start() {
 			case <-b.stop:
 				if len(batch) > 0 {
 					emit()
-					timerCh = nil
 				}
 				return
 			case p := <-b.in:
@@ -92,13 +104,11 @@ func (b *PointBatcher) Start() {
 				if len(batch) >= b.size { // 0 means send immediately.
 					atomic.AddUint64(&b.stats.SizeTotal, 1)
 					emit()
-					timerCh = nil
 				}
 
 			case <-b.flush:
 				if len(batch) > 0 {
 					emit()
-					timerCh = nil
 				}
 
 			case <-timerCh:
